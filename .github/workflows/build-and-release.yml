@@ -1,0 +1,273 @@
+name: Build & Release Custom Cinnabar
+
+on:
+  workflow_dispatch:
+    inputs:
+      cinnabar_ref:
+        description: "Branche ou tag officiel de Cinnabar (ex: dev)"
+        required: true
+        default: "dev"
+        type: string
+      code_branch:
+        description: "Branche du repository de code custom (projet-chill)"
+        required: true
+        default: "main"
+        type: string
+      version_suffix:
+        description: "Suffixe de version personnalisée (ex: chill1)"
+        required: false
+        default: "chill1"
+        type: string
+      channel:
+        description: "Canal de mise à jour"
+        required: true
+        default: "beta"
+        type: choice
+        options:
+          - beta
+          - nightly
+  schedule:
+    # Vérification et compilation quotidienne à 04:00 UTC pour suivre les mises à jour officielles
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Client & Update Payload
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
+      CARGO_PROFILE_RELEASE_STRIP: "debuginfo"
+      UPDATE_TRUSTED_KEYS: ${{ vars.UPDATE_TRUSTED_KEYS }}
+      CINNABAR_UPDATE_SIGNING_KEY: ${{ secrets.CINNABAR_UPDATE_SIGNING_KEY }}
+      CINNABAR_RELEASE_CHANNEL: ${{ inputs.channel || 'beta' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out Chill-project (compilation repo)
+        uses: actions/checkout@v4
+        with:
+          path: comp
+
+      - name: Check out upstream Cinnabar
+        uses: actions/checkout@v4
+        with:
+          repository: cinnabar-mc/cinnabar
+          ref: ${{ inputs.cinnabar_ref || 'dev' }}
+          fetch-depth: 0
+          path: cinnabar
+
+      - name: Check out custom modifications (code repo)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: regarde-pas/projet-chill
+          ref: ${{ inputs.code_branch || 'main' }}
+          token: ${{ secrets.GH_PAT || github.token }}
+          path: custom-code
+
+      - name: Apply custom code and patches
+        shell: pwsh
+        run: |
+          $codeDir = Join-Path $env:GITHUB_WORKSPACE "custom-code"
+          $cinnabarDir = Join-Path $env:GITHUB_WORKSPACE "cinnabar"
+          
+          if (Test-Path $codeDir) {
+            Write-Host "Vérification des modifications dans custom-code..."
+            
+            # 1. Appliquer les patches git s'il y en a
+            $patchesDir = Join-Path $codeDir "patches"
+            if (Test-Path $patchesDir) {
+              $patches = Get-ChildItem -Path $patchesDir -Filter "*.patch"
+              foreach ($patch in $patches) {
+                Write-Host "Application du patch: $($patch.Name)"
+                git -C $cinnabarDir apply --verbose $patch.FullName
+              }
+            }
+            
+            # 2. Copier les dossiers/fichiers personnalisés (ex: autoclicker, scripts, etc.)
+            $items = Get-ChildItem -Path $codeDir -Exclude ".git", "patches", "README.md"
+            foreach ($item in $items) {
+              Write-Host "Copie de $($item.Name) dans cinnabar/"
+              Copy-Item -Path $item.FullName -Destination $cinnabarDir -Recurse -Force
+            }
+          } else {
+            Write-Host "Aucun dossier custom-code trouvé, compilation de la base Cinnabar."
+          }
+
+      - name: Configure release repository pointer
+        shell: pwsh
+        run: |
+          $releaseAssetsPath = "cinnabar/packaging/release-assets.json"
+          $json = Get-Content $releaseAssetsPath -Raw | ConvertFrom-Json
+          
+          # Rediriger le repository de mise à jour vers ce repo (Chill-project)
+          $currentRepo = "${{ github.repository }}"
+          Write-Host "Redirection du repo de mise à jour vers: $currentRepo"
+          $json.repository = $currentRepo
+          
+          $json | ConvertTo-Json -Depth 10 | Set-Content $releaseAssetsPath -Encoding utf8
+
+      - name: Install Rust toolchain
+        working-directory: cinnabar
+        run: rustup toolchain install
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Install WiX, ImageMagick and make
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+          choco install imagemagick --no-progress -y
+          if (-not (Get-Command make -ErrorAction SilentlyContinue)) { choco install make --no-progress -y }
+          $magick = Get-ChildItem "$env:ProgramFiles\ImageMagick*" -Directory | Select-Object -First 1
+          if ($magick) { Add-Content $env:GITHUB_PATH $magick.FullName }
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.dotnet\tools"
+          Add-Content $env:GITHUB_PATH "$env:ProgramData\chocolatey\bin"
+
+      - name: Determine version and tags
+        id: version
+        shell: pwsh
+        run: |
+          $cargo = Get-Content "cinnabar/Cargo.toml" -Raw
+          if ($cargo -match 'version\s*=\s*"([^"]+)"') {
+            $baseVer = $matches[1]
+          } else {
+            $baseVer = "0.1.28"
+          }
+          $suffix = "${{ inputs.version_suffix || 'chill1' }}"
+          $fullVer = "v$baseVer-$suffix"
+          $runNum = "${{ github.run_number }}"
+          $buildNum = [int]$runNum + 1000000
+          
+          Write-Host "Version de base: $baseVer"
+          Write-Host "Tag de release: $fullVer"
+          Write-Host "Build number: $buildNum"
+          
+          "base_version=$baseVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_tag=$fullVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "build_number=$buildNum" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Package Windows binaries
+        working-directory: cinnabar
+        env:
+          CINNABAR_BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          make package-binaries
+          pwsh -NoProfile -File packaging/windows/build-installer.ps1 -Root "$GITHUB_WORKSPACE/cinnabar"
+
+      - name: Prepare release artifacts and update payload
+        shell: pwsh
+        run: |
+          $distDir = "cinnabar/.local/dist/windows-release"
+          $outDir = "dist"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          
+          $setupExe = Get-ChildItem -Path $distDir -Filter "*x64-setup.exe" | Select-Object -First 1
+          $msi = Get-ChildItem -Path $distDir -Filter "*x64.msi" | Select-Object -First 1
+          
+          if (-not $setupExe -or -not $msi) {
+            throw "Binaires non trouvés dans $distDir !"
+          }
+          
+          Copy-Item $setupExe.FullName -Destination "$outDir/Cinnabar-x64-setup.exe"
+          
+          # Calculer le SHA256 du MSI pour créer le payload immutable
+          $hashStream = [System.IO.File]::OpenRead($msi.FullName)
+          $sha256 = [System.Security.Cryptography.SHA256]::Create().ComputeHash($hashStream)
+          $hashStream.Close()
+          $hashHex = [System.BitConverter]::ToString($sha256).Replace("-", "").ToLower()
+          $shortHash = $hashHex.Substring(0, 16)
+          $payloadName = "update-payload-$shortHash-Cinnabar-x64.msi"
+          
+          Copy-Item $msi.FullName -Destination "$outDir/$payloadName"
+          
+          "msi_sha256=$hashHex" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "msi_size=$($msi.Length)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "payload_name=$payloadName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          
+          Write-Host "Payload MSI généré: $payloadName ($($msi.Length) bytes, SHA256: $hashHex)"
+
+      - name: Sign update manifest (update-beta.json)
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          BASE_VERSION: ${{ steps.version.outputs.base_version }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+          PAYLOAD_NAME: ${{ env.payload_name }}
+          CHANNEL: ${{ inputs.channel || 'beta' }}
+        run: |
+          if (-not $env:CINNABAR_UPDATE_SIGNING_KEY) {
+            Write-Warning "CINNABAR_UPDATE_SIGNING_KEY n'est pas défini dans les secrets GitHub. Le manifest ne sera pas signé."
+            exit 0
+          }
+          
+          $payloadUrl = "https://github.com/$env:GH_REPO/releases/download/$env:RELEASE_TAG/$env:PAYLOAD_NAME"
+          $localPayload = "dist/$env:PAYLOAD_NAME"
+          
+          Write-Host "Signature du manifest pour $payloadUrl..."
+          
+          # Utilisation de release-manifest depuis cinnabar
+          Push-Location cinnabar
+          cargo run --quiet --locked -p release-manifest -- sign `
+            -version "$env:BASE_VERSION" `
+            -channel "$env:CHANNEL" `
+            -build-number "$env:BUILD_NUMBER" `
+            -key-id "chill1" `
+            -artifact "windows-x86_64=$payloadUrl=$GITHUB_WORKSPACE/$localPayload" `
+            > "$GITHUB_WORKSPACE/dist/update-beta.json"
+          Pop-Location
+          
+          Write-Host "Manifest update-beta.json signé avec succès !"
+
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        working-directory: dist
+        run: |
+          $lines = @()
+          Get-ChildItem -File | ForEach-Object {
+            $stream = [System.IO.File]::OpenRead($_.FullName)
+            $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
+            $stream.Close()
+            $hex = [System.BitConverter]::ToString($hash).Replace("-", "").ToLower()
+            $lines += "$hex  $($_.Name)"
+          }
+          $lines | Set-Content "SHA256SUMS.txt" -Encoding ascii
+          Get-Content "SHA256SUMS.txt"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.release_tag }}
+          TITLE: "${{ steps.version.outputs.release_tag }} (Custom Cinnabar)"
+        run: |
+          $notes = @"
+          ## Cinnabar Custom Build - $env:TAG
+          
+          - **Version Cinnabar**: $($env:steps_version_outputs_base_version)
+          - **Build number**: $($env:steps_version_outputs_build_number)
+          - **Mise à jour en jeu**: Supportée automatiquement via update-beta.json
+          
+          ### Téléchargements
+          - Nouvelle installation: `Cinnabar-x64-setup.exe`
+          - Mise à jour automatique (utilisée par le jeu): `$($env:payload_name)`
+          "@
+          
+          gh release create $env:TAG dist/* `
+            --title $env:TITLE `
+            --notes $notes `
+            --latest=true

@@ -1,0 +1,39 @@
+name: Generate Signing Keys
+
+on:
+  workflow_dispatch:
+
+jobs:
+  keygen:
+    name: Generate Ed25519 Keys
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Cinnabar
+        uses: actions/checkout@v4
+        with:
+          repository: cinnabar-mc/cinnabar
+          ref: dev
+          path: cinnabar
+
+      - name: Install Rust
+        working-directory: cinnabar
+        run: rustup toolchain install
+
+      - name: Generate Keypair
+        working-directory: cinnabar
+        run: |
+          echo "=================================================="
+          echo "GENERATING NEW ED25519 SIGNING KEYPAIR..."
+          echo "=================================================="
+          cargo run --quiet -p release-manifest -- keygen
+          echo "=================================================="
+          echo "INSTRUCTIONS:"
+          echo "1. Allez dans Settings -> Secrets and variables -> Actions"
+          echo "2. Dans l'onglet 'Variables' -> New repository variable:"
+          echo "   Name:  UPDATE_TRUSTED_KEYS"
+          echo "   Value: chill1:<PUBLIC_KEY_CI_DESSUS>"
+          echo ""
+          echo "3. Dans l'onglet 'Secrets' -> New repository secret:"
+          echo "   Name:  CINNABAR_UPDATE_SIGNING_KEY"
+          echo "   Value: <PRIVATE_SEED_CI_DESSUS>"
+          echo "=================================================="

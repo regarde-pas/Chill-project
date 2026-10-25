@@ -1,0 +1,11 @@
+# Build outputs & temporary files
+dist/
+target/
+.upstream_sha
+*.seed
+*.key
+*.pfx
+
+# OS files
+Thumbs.db
+.DS_Store
