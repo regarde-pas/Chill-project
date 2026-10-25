@@ -1,4 +1,4 @@
-name: Build & Release Custom Cinnabar
+name: Build & Release Custom Cinnabar (Ultra-Fast)
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ on:
           - beta
           - nightly
   schedule:
-    # Vérification et compilation quotidienne à 04:00 UTC pour suivre les mises à jour officielles
+    # Vérification quotidienne à 04:00 UTC pour suivre les mises à jour officielles
     - cron: "0 4 * * *"
 
 permissions:
@@ -35,15 +35,22 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Windows Client & Update Payload
+    name: Build Windows Client & Update Payload (Incremental)
     runs-on: windows-2025
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
+      # --- Optimisations de vitesse de compilation Rust ---
       CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: "1"                     # Recompile UNIQUEMENT les fichiers modifiés
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"   # Parallélisation multi-cœurs (au lieu de 1)
+      CARGO_PROFILE_RELEASE_LTO: "thin"          # Thin LTO rapide au lieu de Full LTO lent
       CARGO_PROFILE_RELEASE_DEBUG: "line-tables-only"
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "packed"
       CARGO_PROFILE_RELEASE_STRIP: "debuginfo"
+      RUSTFLAGS: "-C linker=rust-lld.exe"        # Linker multithreadé LLD (3x plus rapide que link.exe)
+      SCCACHE_GHA_ENABLED: "true"                # Cache partagé de compilation sccache sur GitHub Actions
+      RUSTC_WRAPPER: "sccache"
+      # --- Clés et canaux Cinnabar ---
       UPDATE_TRUSTED_KEYS: ${{ vars.UPDATE_TRUSTED_KEYS }}
       CINNABAR_UPDATE_SIGNING_KEY: ${{ secrets.CINNABAR_UPDATE_SIGNING_KEY }}
       CINNABAR_RELEASE_CHANNEL: ${{ inputs.channel || 'beta' }}
@@ -61,7 +68,7 @@ jobs:
         with:
           repository: cinnabar-mc/cinnabar
           ref: ${{ inputs.cinnabar_ref || 'dev' }}
-          fetch-depth: 0
+          fetch-depth: 1 # Shallow clone pour rapidité maximale
           path: cinnabar
 
       - name: Check out custom modifications (code repo)
@@ -71,6 +78,7 @@ jobs:
           repository: regarde-pas/projet-chill
           ref: ${{ inputs.code_branch || 'main' }}
           token: ${{ secrets.GH_PAT || github.token }}
+          fetch-depth: 1
           path: custom-code
 
       - name: Apply custom code and patches
@@ -108,7 +116,6 @@ jobs:
           $releaseAssetsPath = "cinnabar/packaging/release-assets.json"
           $json = Get-Content $releaseAssetsPath -Raw | ConvertFrom-Json
           
-          # Rediriger le repository de mise à jour vers ce repo (Chill-project)
           $currentRepo = "${{ github.repository }}"
           Write-Host "Redirection du repo de mise à jour vers: $currentRepo"
           $json.repository = $currentRepo
@@ -119,19 +126,49 @@ jobs:
         working-directory: cinnabar
         run: rustup toolchain install
 
-      - name: Setup Go
+      # --- 1. Sccache Compiler Cache (Cache partagé de bytecode compilé) ---
+      - name: Setup Sccache (Shared Compilation Cache)
+        uses: mozilla/sccache-action@v0.0.8
+        with:
+          version: "v0.8.2"
+
+      # --- 2. Rust & Target Cache (Ne recompile que les crates modifiées) ---
+      - name: Rust Cache (Incremental crate cache)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "cinnabar -> target"
+          cache-on-failure: false
+          save-if: true
+
+      # --- 3. Go Setup & Cache ---
+      - name: Setup Go with Cache
         uses: actions/setup-go@v5
         with:
           go-version: 'stable'
-          cache: false
+          cache: true
+          cache-dependency-path: cinnabar/go.work.sum
+
+      # --- 4. WiX & Build Tools Caching ---
+      - name: Cache Tools (WiX & Chocolatey)
+        id: tools-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\ProgramData\chocolatey\bin
+            C:\ProgramData\chocolatey\lib
+            ${{ env.USERPROFILE }}\.dotnet\tools
+          key: ${{ runner.os }}-build-tools-wix5-v1
 
       - name: Install WiX, ImageMagick and make
         shell: pwsh
         run: |
-          dotnet tool install --global wix --version 5.0.2
-          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
-          choco install imagemagick --no-progress -y
-          if (-not (Get-Command make -ErrorAction SilentlyContinue)) { choco install make --no-progress -y }
+          if (-not (Get-Command make -ErrorAction SilentlyContinue)) {
+            choco install make imagemagick --no-progress -y
+          }
+          if (-not (Test-Path "$env:USERPROFILE\.dotnet\tools\wix.exe")) {
+            dotnet tool install --global wix --version 5.0.2
+            & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.BootstrapperApplications.wixext/5.0.2
+          }
           $magick = Get-ChildItem "$env:ProgramFiles\ImageMagick*" -Directory | Select-Object -First 1
           if ($magick) { Add-Content $env:GITHUB_PATH $magick.FullName }
           Add-Content $env:GITHUB_PATH "$env:USERPROFILE\.dotnet\tools"
@@ -160,13 +197,19 @@ jobs:
           "release_tag=$fullVer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "build_number=$buildNum" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Package Windows binaries
+      - name: Check Sccache statistics before build
+        run: sccache --show-stats || true
+
+      - name: Package Windows binaries (Incremental & Fast Link)
         working-directory: cinnabar
         env:
           CINNABAR_BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
         run: |
           make package-binaries
           pwsh -NoProfile -File packaging/windows/build-installer.ps1 -Root "$GITHUB_WORKSPACE/cinnabar"
+
+      - name: Check Sccache statistics after build (Cache Hit Rate)
+        run: sccache --show-stats || true
 
       - name: Prepare release artifacts and update payload
         shell: pwsh
@@ -220,7 +263,6 @@ jobs:
           
           Write-Host "Signature du manifest pour $payloadUrl..."
           
-          # Utilisation de release-manifest depuis cinnabar
           Push-Location cinnabar
           cargo run --quiet --locked -p release-manifest -- sign `
             -version "$env:BASE_VERSION" `

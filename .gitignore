@@ -5,6 +5,8 @@ target/
 *.seed
 *.key
 *.pfx
+chill_keys_backup.json
+*keys_backup*.json
 
 # OS files
 Thumbs.db
